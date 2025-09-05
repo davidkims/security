@@ -1,4 +1,5 @@
-name: "CI (Spring Boot via curl + Maven, No-Heredoc)"
+# .github/workflows/springboot-curl-ci.yml
+name: "CI (Spring Boot via curl + Upgrade + Release)"
 
 on:
   push:
@@ -28,9 +29,29 @@ on:
         required: true
         default: "17"
       dependencies:
-        description: "쉼표구분 deps (예: web,actuator,lombok,validation)"
+        description: "쉼표 구분 deps (예: web,actuator,lombok,validation)"
         required: true
         default: "web,actuator,lombok,validation"
+      run_upgrade:
+        description: "업그레이드 수행 여부 (Maven Wrapper/Boot/Deps)"
+        required: true
+        default: "true"
+      run_release:
+        description: "릴리즈 생성 여부 (JAR/소스 ZIP 업로드)"
+        required: true
+        default: "true"
+      release_mode:
+        description: "릴리즈 모드: auto-patch/minor/major/manual-tag"
+        required: true
+        default: "auto-patch"
+      templates_zip_url:
+        description: "(선택) 템플릿 ZIP URL(오버레이). 비우면 폴백 생성"
+        required: false
+        default: ""
+
+permissions:
+  contents: write   # 릴리즈/태그/커밋을 위해 write 권한 필요
+  actions: read
 
 jobs:
   build:
@@ -44,6 +65,11 @@ jobs:
       JAVA_VERSION: ${{ github.event.inputs.java_version || '17' }}
       DEPENDENCIES: ${{ github.event.inputs.dependencies || 'web,actuator,lombok,validation' }}
       PROJECT_DIR: .
+      RUN_UPGRADE: ${{ github.event.inputs.run_upgrade || 'true' }}
+      RUN_RELEASE: ${{ github.event.inputs.run_release || 'true' }}
+      RELEASE_MODE: ${{ github.event.inputs.release_mode || 'auto-patch' }}
+      TEMPLATES_ZIP_URL: ${{ github.event.inputs.templates_zip_url || '' }}
+      MVN_WRAPPER_TARGET: "3.9.9"   # 필요시 수정
 
     steps:
       - name: Checkout
@@ -53,9 +79,9 @@ jobs:
         run: |
           set -Eeuo pipefail
           sudo apt-get update -y
-          sudo apt-get install -y curl unzip
+          sudo apt-get install -y curl unzip zip git jq
 
-      - name: Generate Spring Boot project via curl (robust with fallbacks)
+      - name: Generate Spring Boot project via curl (robust + fallbacks)
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -83,7 +109,8 @@ jobs:
             fi
 
             args=(
-              --get -L -sS -o "${ZIP_PATH}" -w "%{http_code}"
+              --get -L -sS --retry 3 --retry-delay 2
+              -o "${ZIP_PATH}" -w "%{http_code}"
               --data-urlencode "type=maven-project"
               --data-urlencode "language=java"
               --data-urlencode "baseDir=${ARTIFACT_ID}"
@@ -116,7 +143,7 @@ jobs:
             return 0
           }
 
-          # 1) 사용자 bootVersion + 전체 deps → 실패 시 2) bootVersion 제거 → 실패 시 3) 최소 deps(web)
+          # 1) 사용자 bootVersion + full deps → 2) bootVersion 제거 → 3) 최소 deps(web)
           if ! attempt_download "with" "full"; then
             echo "Retry without bootVersion..."
             if ! attempt_download "without" "full"; then
@@ -136,47 +163,111 @@ jobs:
             rmdir "${PROJECT_DIR}/${ARTIFACT_ID}"
           fi
 
-      - name: Ensure basic files (.gitignore via curl, app.yml, sample controller) — no heredoc
+      - name: Overlay templates (curl if URL provided) and create defaults (printf fallback)
         shell: bash
         run: |
           set -Eeuo pipefail
 
-          # .gitignore: 원격 다운로드, 실패 시 로컬 생성 (printf)
+          # 0) templates_zip_url이 있으면 오버레이
+          if [ -n "${TEMPLATES_ZIP_URL}" ]; then
+            echo "Downloading templates ZIP overlay..."
+            TMP_TPL="${RUNNER_TEMP}/tpl.zip"
+            if curl -fsSL --retry 3 --retry-delay 2 "${TEMPLATES_ZIP_URL}" -o "${TMP_TPL}"; then
+              if unzip -t "${TMP_TPL}" >/dev/null 2>&1; then
+                unzip -oq "${TMP_TPL}" -d .
+              else
+                echo "::warning::templates_zip_url is not a valid zip, skip overlay"
+              fi
+            else
+              echo "::warning::Failed to download templates_zip_url, skip overlay"
+            fi
+          fi
+
+          # 1) .gitignore: 원격 템플릿 → 실패 시 폴백
           if [ ! -f ".gitignore" ]; then
             echo "Downloading Java.gitignore ..."
             if ! curl -fsSL "https://raw.githubusercontent.com/github/gitignore/main/Java.gitignore" -o ".gitignore"; then
               echo "::warning::.gitignore download failed; creating fallback"
               printf '%s\n' \
-                'target/' \
-                '.idea/' \
-                '.project' \
-                '.classpath' \
-                '.settings/' \
-                '.DS_Store' \
-                '*.iml' \
-                > .gitignore
+                'target/' '.idea/' '.project' '.classpath' '.settings/' \
+                '.DS_Store' '*.iml' > .gitignore
             fi
           fi
 
-          # resources/application.yml (printf)
-          RES_DIR="src/main/resources"
-          mkdir -p "${RES_DIR}"
-          if [ ! -f "${RES_DIR}/application.yml" ]; then
-            printf '%s\n' \
-              'server:' \
-              '  port: 8080' \
-              'management:' \
-              '  endpoints:' \
-              '    web:' \
-              '      exposure:' \
-              '        include: health,info' \
-              'spring:' \
-              '  application:' \
-              '    name: demo-app' \
-              > "${RES_DIR}/application.yml"
+          # 2) .editorconfig (curl → fallback)
+          if [ ! -f ".editorconfig" ]; then
+            if ! curl -fsSL "https://raw.githubusercontent.com/editorconfig/editorconfig-core-test/master/config/EditorConfig" -o ".editorconfig"; then
+              printf '%s\n' \
+                'root = true' '' \
+                '[*]' \
+                'end_of_line = lf' \
+                'insert_final_newline = true' \
+                'charset = utf-8' \
+                'indent_style = space' \
+                'indent_size = 2' > .editorconfig
+            fi
           fi
 
-          # 샘플 컨트롤러 (printf)
+          # 3) .gitattributes (curl → fallback)
+          if [ ! -f ".gitattributes" ]; then
+            if ! curl -fsSL "https://raw.githubusercontent.com/alexkaratarakis/gitattributes/master/Java.gitattributes" -o ".gitattributes"; then
+              printf '%s\n' \
+                '* text=auto eol=lf' \
+                '*.java diff=java' > .gitattributes
+            fi
+          fi
+
+          # 4) resources yml들
+          RES="src/main/resources"
+          mkdir -p "${RES}"
+          [ -f "${RES}/application.yml" ] || printf '%s\n' \
+            'server:' '  port: 8080' \
+            'management:' '  endpoints:' '    web:' '      exposure:' '        include: health,info' \
+            'spring:' '  application:' '    name: demo-app' > "${RES}/application.yml"
+
+          [ -f "${RES}/application-dev.yml" ] || printf '%s\n' \
+            'spring:' '  config:' '    activate:' '      on-profile: dev' \
+            'server:' '  port: 8081' > "${RES}/application-dev.yml"
+
+          [ -f "${RES}/application-prod.yml" ] || printf '%s\n' \
+            'spring:' '  config:' '    activate:' '      on-profile: prod' \
+            'server:' '  port: 8080' > "${RES}/application-prod.yml"
+
+          # 5) Dockerfile (curl → fallback)
+          if [ ! -f "Dockerfile" ]; then
+            if ! curl -fsSL "https://raw.githubusercontent.com/spring-projects/spring-boot/main/spring-boot-project/spring-boot-tools/spring-boot-gradle-plugin/src/docs/gradle/packaging/docker/Dockerfile" -o Dockerfile; then
+              printf '%s\n' \
+                'FROM eclipse-temurin:17-jre' \
+                'WORKDIR /app' \
+                'ARG JAR_FILE=target/*.jar' \
+                'COPY ${JAR_FILE} app.jar' \
+                'EXPOSE 8080' \
+                'ENTRYPOINT ["java","-jar","/app/app.jar"]' > Dockerfile
+            fi
+          fi
+
+          # 6) compose.yaml (curl → fallback)
+          if [ ! -f "compose.yaml" ]; then
+            if ! curl -fsSL "https://raw.githubusercontent.com/docker/awesome-compose/master/spring-postgres/docker-compose.yaml" -o compose.yaml; then
+              printf '%s\n' \
+                'services:' \
+                '  app:' \
+                '    build: .' \
+                '    ports: ["8080:8080"]' \
+                '    environment:' \
+                '      - SPRING_PROFILES_ACTIVE=dev' > compose.yaml
+            fi
+          fi
+
+          # 7) Procfile / Makefile (fallback)
+          [ -f "Procfile" ] || printf '%s\n' 'web: java -jar target/*.jar' > Procfile
+          if [ ! -f "Makefile" ]; then
+            printf '%s\n' \
+              'build:' '\t./mvnw -B -DskipTests package' \
+              'run:' '\t./mvnw spring-boot:run' > Makefile
+          fi
+
+          # 8) 샘플 컨트롤러 (없을 때만)
           APP_DIR="src/main/java/$(echo "${PACKAGE_NAME}" | tr '.' '/')"
           mkdir -p "${APP_DIR}"
           if ! ls "${APP_DIR}"/*.java >/dev/null 2>&1; then
@@ -193,28 +284,17 @@ jobs:
               "  public String hello() {" \
               "    return \"Hello Spring Boot (curl + CI)!\";" \
               "  }" \
-              "}" \
-              > "${TMP_JAVA}"
+              "}" > "${TMP_JAVA}"
             mv "${TMP_JAVA}" "${APP_DIR}/HelloController.java"
           fi
 
-          # README.md (printf)
+          # 9) README.md
           if [ ! -f "README.md" ]; then
             printf '%s\n' \
-              "# ${ARTIFACT_ID}" \
-              "" \
-              "Generated via GitHub Actions (curl + Spring Initializr)" \
-              "" \
-              "## Build" \
-              '```bash' \
-              "./mvnw -B -DskipTests package" \
-              '```' \
-              "" \
-              "## Run" \
-              '```bash' \
-              "./mvnw spring-boot:run" \
-              '```' \
-              > README.md
+              "# ${ARTIFACT_ID}" "" \
+              "Generated via GitHub Actions (curl + Initializr + Upgrade + Release)" "" \
+              "## Build" '```bash' "./mvnw -B -DskipTests package" '```' "" \
+              "## Run" '```bash' "./mvnw spring-boot:run" '```' > README.md
           fi
 
       - name: Set up Java (Temurin ${{ env.JAVA_VERSION }})
@@ -228,9 +308,30 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
+          if [ -f "./mvnw" ]; then chmod +x ./mvnw; fi
+
+      - name: Upgrade (Maven Wrapper / Spring Boot / Deps)
+        if: ${{ env.RUN_UPGRADE == 'true' }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          # Maven Wrapper → 3.9.9 (없으면 mvn 설치 후 수행)
           if [ -f "./mvnw" ]; then
-            chmod +x ./mvnw
+            ./mvnw -B -ntp -N wrapper:wrapper -Dmaven="${MVN_WRAPPER_TARGET}" || true
+          else
+            sudo apt-get update -y && sudo apt-get install -y maven
+            mvn -B -ntp -N wrapper:wrapper -Dmaven="${MVN_WRAPPER_TARGET}" || true
           fi
+          [ -f "./mvnw" ] && chmod +x ./mvnw
+
+          # Spring Boot 버전 지정 시 우선 반영 (property 또는 parent)
+          if [ -n "${BOOT_VERSION}" ]; then
+            ./mvnw -B -ntp versions:set-property -Dproperty=spring-boot.version -DnewVersion="${BOOT_VERSION}" -DgenerateBackupPoms=false || true
+            ./mvnw -B -ntp versions:update-parent -DparentVersion="[${BOOT_VERSION}]" -DgenerateBackupPoms=false || true
+          fi
+
+          # 의존성 최신 릴리즈로 (스냅샷 제외)
+          ./mvnw -B -ntp versions:use-latest-releases -DallowSnapshots=false -DgenerateBackupPoms=false || true
 
       - name: Build with Maven Wrapper (or apt maven)
         shell: bash
@@ -250,3 +351,73 @@ jobs:
           set -Eeuo pipefail
           echo "Artifacts under target/:"
           find target -maxdepth 1 -type f -name "*.jar" -print || true
+
+      - name: Optionally bump version in pom.xml (for auto-* modes)
+        if: ${{ env.RUN_RELEASE == 'true' && github.event_name != 'pull_request' && startsWith(env.RELEASE_MODE, 'auto-') }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          # 현재 버전 추출 (첫 번째 <version>…</version>)
+          CURR_VER="$(grep -m1 -oE '<version>[^<]+' pom.xml | sed 's/<version>//' | sed 's/-SNAPSHOT$//')"
+          echo "Current version: ${CURR_VER}"
+          MAJ=$(echo "${CURR_VER}" | cut -d. -f1)
+          MIN=$(echo "${CURR_VER}" | cut -d. -f2)
+          PAT=$(echo "${CURR_VER}" | cut -d. -f3 | sed 's/[^0-9].*//;s/^$/.0/')
+          [ -z "${MAJ}" ] && MAJ=0
+          [ -z "${MIN}" ] && MIN=0
+          [ -z "${PAT}" ] && PAT=0
+          case "${RELEASE_MODE}" in
+            auto-major) MAJ=$((MAJ+1)); MIN=0; PAT=0 ;;
+            auto-minor) MIN=$((MIN+1)); PAT=0 ;;
+            auto-patch|*) PAT=$((PAT+1)) ;;
+          esac
+          NEW_VER="${MAJ}.${MIN}.${PAT}"
+          echo "Bumping to ${NEW_VER}"
+          ./mvnw -B -ntp versions:set -DnewVersion="${NEW_VER}" -DgenerateBackupPoms=false || true
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add pom.xml
+          git commit -m "chore(release): bump version to ${NEW_VER}" || true
+          git push || true
+          echo "NEW_VERSION=${NEW_VER}" >> $GITHUB_ENV
+
+      - name: Prepare tag for release
+        if: ${{ env.RUN_RELEASE == 'true' && github.event_name != 'pull_request' }}
+        id: tagger
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          if [ "${RELEASE_MODE}" = "manual-tag" ] && [ -n "${NEW_VERSION}" ]; then
+            TAG="v${NEW_VERSION}"
+          elif [ "${RELEASE_MODE}" = "manual-tag" ]; then
+            # 수동 태그 모드지만 버전 미지정 → 타임스탬프 태그
+            TAG="v$(date +%Y%m%d-%H%M%S)"
+          elif [ -n "${NEW_VERSION}" ]; then
+            TAG="v${NEW_VERSION}"
+          else
+            TAG="v$(date +%Y%m%d-%H%M%S)"
+          fi
+          echo "tag=${TAG}" >> $GITHUB_OUTPUT
+          echo "Release tag: ${TAG}"
+          git tag -a "${TAG}" -m "Release ${TAG}" || true
+          git push origin "${TAG}" || true
+
+      - name: Zip source for release
+        if: ${{ env.RUN_RELEASE == 'true' && github.event_name != 'pull_request' }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          ZIP_OUT="${RUNNER_TEMP}/${{ env.ARTIFACT_ID }}-src.zip"
+          # 리포 전체를 zip (gitignored 포함 X)
+          git archive -o "${ZIP_OUT}" HEAD
+
+      - name: Create GitHub Release and Upload Artifacts
+        if: ${{ env.RUN_RELEASE == 'true' && github.event_name != 'pull_request' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tagger.outputs.tag }}
+          name: Release ${{ steps.tagger.outputs.tag }}
+          generate_release_notes: true
+          files: |
+            target/*.jar
+            ${{ runner.temp }}/${{ env.ARTIFACT_ID }}-src.zip

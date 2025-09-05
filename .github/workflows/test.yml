@@ -1,5 +1,4 @@
-# .github/workflows/springboot-curl-ci.yml
-name: "CI (Spring Boot via curl + Upgrade + Release)"
+name: "CI (Spring Boot via curl + Upgrade + Release, Unified)"
 
 on:
   push:
@@ -45,12 +44,12 @@ on:
         required: true
         default: "auto-patch"
       templates_zip_url:
-        description: "(선택) 템플릿 ZIP URL(오버레이). 비우면 폴백 생성"
+        description: "(선택) 템플릿 ZIP RAW URL(오버레이). 비우면 폴백 생성"
         required: false
         default: ""
 
 permissions:
-  contents: write   # 릴리즈/태그/커밋을 위해 write 권한 필요
+  contents: write
   actions: read
 
 jobs:
@@ -69,7 +68,7 @@ jobs:
       RUN_RELEASE: ${{ github.event.inputs.run_release || 'true' }}
       RELEASE_MODE: ${{ github.event.inputs.release_mode || 'auto-patch' }}
       TEMPLATES_ZIP_URL: ${{ github.event.inputs.templates_zip_url || '' }}
-      MVN_WRAPPER_TARGET: "3.9.9"   # 필요시 수정
+      MVN_WRAPPER_TARGET: "3.9.9"
 
     steps:
       - name: Checkout
@@ -85,8 +84,6 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-
-          # 기존 pom.xml 있으면 생성 스킵
           if find "${PROJECT_DIR}" -maxdepth 2 -name "pom.xml" | grep -q .; then
             echo "pom.xml detected -> skip Initializr download"
             exit 0
@@ -96,66 +93,32 @@ jobs:
           ZIP_PATH="${RUNNER_TEMP}/${ARTIFACT_ID}.zip"
           DEPS_NO_SPACE="$(echo "${DEPENDENCIES}" | tr -d '[:space:]')"
 
-          attempt_download() {
-            local use_boot="$1"   # "with" or "without"
-            local min_deps="$2"   # "full" or "minimal"
-            local http_code
-
-            echo "::group::Attempt: bootVersion=${use_boot}, deps=${min_deps}"
-            if [ "${min_deps}" = "minimal" ]; then
-              req_deps="web"
-            else
-              req_deps="${DEPS_NO_SPACE}"
-            fi
-
-            args=(
-              --get -L -sS --retry 3 --retry-delay 2
-              -o "${ZIP_PATH}" -w "%{http_code}"
-              --data-urlencode "type=maven-project"
-              --data-urlencode "language=java"
-              --data-urlencode "baseDir=${ARTIFACT_ID}"
-              --data-urlencode "groupId=${GROUP_ID}"
-              --data-urlencode "artifactId=${ARTIFACT_ID}"
-              --data-urlencode "name=${ARTIFACT_ID}"
-              --data-urlencode "packageName=${PACKAGE_NAME}"
-              --data-urlencode "javaVersion=${JAVA_VERSION}"
-              --data-urlencode "dependencies=${req_deps}"
-            )
+          attempt() {
+            local use_boot="$1"   # with|without
+            local deps="$2"       # full|minimal
+            local req_deps="${DEPS_NO_SPACE}"
+            [ "${deps}" = "minimal" ] && req_deps="web"
+            args=( --get -L -sS --retry 3 --retry-delay 2 -o "${ZIP_PATH}" -w "%{http_code}"
+                   --data-urlencode "type=maven-project"
+                   --data-urlencode "language=java"
+                   --data-urlencode "baseDir=${ARTIFACT_ID}"
+                   --data-urlencode "groupId=${GROUP_ID}"
+                   --data-urlencode "artifactId=${ARTIFACT_ID}"
+                   --data-urlencode "name=${ARTIFACT_ID}"
+                   --data-urlencode "packageName=${PACKAGE_NAME}"
+                   --data-urlencode "javaVersion=${JAVA_VERSION}"
+                   --data-urlencode "dependencies=${req_deps}" )
             if [ "${use_boot}" = "with" ] && [ -n "${BOOT_VERSION}" ]; then
               args+=( --data-urlencode "bootVersion=${BOOT_VERSION}" )
             fi
-
-            http_code="$(curl "${args[@]}" "${BASE_URL}" || true)"
-            echo "HTTP ${http_code}"
-            if [ "${http_code}" != "200" ]; then
-              echo "::warning::Initializr request failed (HTTP ${http_code})"
-              echo "::endgroup::"
-              return 1
-            fi
-
-            if ! unzip -t "${ZIP_PATH}" >/dev/null 2>&1; then
-              echo "::warning::Downloaded file is not a valid ZIP"
-              echo "::endgroup::"
-              return 1
-            fi
-
-            echo "::endgroup::"
-            return 0
+            code="$(curl "${args[@]}" "${BASE_URL}" || true)"
+            echo "HTTP ${code}"
+            [ "${code}" = "200" ] && unzip -t "${ZIP_PATH}" >/dev/null 2>&1
           }
 
-          # 1) 사용자 bootVersion + full deps → 2) bootVersion 제거 → 3) 최소 deps(web)
-          if ! attempt_download "with" "full"; then
-            echo "Retry without bootVersion..."
-            if ! attempt_download "without" "full"; then
-              echo "Retry with minimal deps..."
-              if ! attempt_download "without" "minimal"; then
-                echo "::error::All Initializr attempts failed"
-                exit 1
-              fi
-            fi
-          fi
+          attempt with full || attempt without full || attempt without minimal || { echo "::error::Initializr download failed"; exit 1; }
 
-          echo "Unzipping to ${PROJECT_DIR} ..."
+          echo "Unzipping..."
           unzip -q "${ZIP_PATH}" -d "${PROJECT_DIR}"
           if [ -d "${PROJECT_DIR}/${ARTIFACT_ID}" ]; then
             shopt -s dotglob
@@ -163,61 +126,35 @@ jobs:
             rmdir "${PROJECT_DIR}/${ARTIFACT_ID}"
           fi
 
-      - name: Overlay templates (curl if URL provided) and create defaults (printf fallback)
+      - name: Overlay templates & create defaults (stable + fallback)
         shell: bash
         run: |
           set -Eeuo pipefail
 
-          # 0) templates_zip_url이 있으면 오버레이
+          fetch() { # fetch <url> <out>
+            local url="$1" out="$2"
+            curl -fsSL --retry 2 --retry-delay 1 "$url" -o "$out"
+          }
+
+          # (0) Overlay ZIP (사용자 제공 URL 있을 때만)
           if [ -n "${TEMPLATES_ZIP_URL}" ]; then
-            echo "Downloading templates ZIP overlay..."
-            TMP_TPL="${RUNNER_TEMP}/tpl.zip"
-            if curl -fsSL --retry 3 --retry-delay 2 "${TEMPLATES_ZIP_URL}" -o "${TMP_TPL}"; then
-              if unzip -t "${TMP_TPL}" >/dev/null 2>&1; then
-                unzip -oq "${TMP_TPL}" -d .
-              else
-                echo "::warning::templates_zip_url is not a valid zip, skip overlay"
-              fi
+            echo "Overlay from templates_zip_url..."
+            TMP_Z="${RUNNER_TEMP}/tpl.zip"
+            if fetch "${TEMPLATES_ZIP_URL}" "${TMP_Z}" && unzip -t "${TMP_Z}" >/dev/null 2>&1; then
+              unzip -oq "${TMP_Z}" -d .
             else
-              echo "::warning::Failed to download templates_zip_url, skip overlay"
+              echo "::warning::templates_zip_url invalid or unreachable; skipped"
             fi
           fi
 
-          # 1) .gitignore: 원격 템플릿 → 실패 시 폴백
+          # (1) .gitignore: GitHub 공식 템플릿 → 실패 시 폴백
           if [ ! -f ".gitignore" ]; then
-            echo "Downloading Java.gitignore ..."
-            if ! curl -fsSL "https://raw.githubusercontent.com/github/gitignore/main/Java.gitignore" -o ".gitignore"; then
-              echo "::warning::.gitignore download failed; creating fallback"
-              printf '%s\n' \
-                'target/' '.idea/' '.project' '.classpath' '.settings/' \
-                '.DS_Store' '*.iml' > .gitignore
+            if ! fetch "https://raw.githubusercontent.com/github/gitignore/refs/heads/main/Java.gitignore" ".gitignore"; then
+              printf '%s\n' 'target/' '.idea/' '.project' '.classpath' '.settings/' '.DS_Store' '*.iml' > .gitignore
             fi
           fi
 
-          # 2) .editorconfig (curl → fallback)
-          if [ ! -f ".editorconfig" ]; then
-            if ! curl -fsSL "https://raw.githubusercontent.com/editorconfig/editorconfig-core-test/master/config/EditorConfig" -o ".editorconfig"; then
-              printf '%s\n' \
-                'root = true' '' \
-                '[*]' \
-                'end_of_line = lf' \
-                'insert_final_newline = true' \
-                'charset = utf-8' \
-                'indent_style = space' \
-                'indent_size = 2' > .editorconfig
-            fi
-          fi
-
-          # 3) .gitattributes (curl → fallback)
-          if [ ! -f ".gitattributes" ]; then
-            if ! curl -fsSL "https://raw.githubusercontent.com/alexkaratarakis/gitattributes/master/Java.gitattributes" -o ".gitattributes"; then
-              printf '%s\n' \
-                '* text=auto eol=lf' \
-                '*.java diff=java' > .gitattributes
-            fi
-          fi
-
-          # 4) resources yml들
+          # (2) resources yml들
           RES="src/main/resources"
           mkdir -p "${RES}"
           [ -f "${RES}/application.yml" ] || printf '%s\n' \
@@ -233,41 +170,41 @@ jobs:
             'spring:' '  config:' '    activate:' '      on-profile: prod' \
             'server:' '  port: 8080' > "${RES}/application-prod.yml"
 
-          # 5) Dockerfile (curl → fallback)
+          # (3) Dockerfile (안전 템플릿)
           if [ ! -f "Dockerfile" ]; then
-            if ! curl -fsSL "https://raw.githubusercontent.com/spring-projects/spring-boot/main/spring-boot-project/spring-boot-tools/spring-boot-gradle-plugin/src/docs/gradle/packaging/docker/Dockerfile" -o Dockerfile; then
-              printf '%s\n' \
-                'FROM eclipse-temurin:17-jre' \
-                'WORKDIR /app' \
-                'ARG JAR_FILE=target/*.jar' \
-                'COPY ${JAR_FILE} app.jar' \
-                'EXPOSE 8080' \
-                'ENTRYPOINT ["java","-jar","/app/app.jar"]' > Dockerfile
-            fi
+            printf '%s\n' \
+              'FROM eclipse-temurin:17-jre' \
+              'WORKDIR /app' \
+              'ARG JAR_FILE=target/*.jar' \
+              'COPY ${JAR_FILE} app.jar' \
+              'EXPOSE 8080' \
+              'ENTRYPOINT ["java","-jar","/app/app.jar"]' \
+              > Dockerfile
           fi
 
-          # 6) compose.yaml (curl → fallback)
+          # (4) compose.yaml (안전 템플릿)
           if [ ! -f "compose.yaml" ]; then
-            if ! curl -fsSL "https://raw.githubusercontent.com/docker/awesome-compose/master/spring-postgres/docker-compose.yaml" -o compose.yaml; then
-              printf '%s\n' \
-                'services:' \
-                '  app:' \
-                '    build: .' \
-                '    ports: ["8080:8080"]' \
-                '    environment:' \
-                '      - SPRING_PROFILES_ACTIVE=dev' > compose.yaml
-            fi
+            printf '%s\n' \
+              'services:' \
+              '  app:' \
+              '    build: .' \
+              '    ports:' \
+              '      - "8080:8080"' \
+              '    environment:' \
+              '      - SPRING_PROFILES_ACTIVE=dev' \
+              > compose.yaml
           fi
 
-          # 7) Procfile / Makefile (fallback)
+          # (5) Procfile / Makefile
           [ -f "Procfile" ] || printf '%s\n' 'web: java -jar target/*.jar' > Procfile
           if [ ! -f "Makefile" ]; then
             printf '%s\n' \
               'build:' '\t./mvnw -B -DskipTests package' \
-              'run:' '\t./mvnw spring-boot:run' > Makefile
+              'run:'   '\t./mvnw spring-boot:run' \
+              > Makefile
           fi
 
-          # 8) 샘플 컨트롤러 (없을 때만)
+          # (6) 샘플 컨트롤러(없을 때만)
           APP_DIR="src/main/java/$(echo "${PACKAGE_NAME}" | tr '.' '/')"
           mkdir -p "${APP_DIR}"
           if ! ls "${APP_DIR}"/*.java >/dev/null 2>&1; then
@@ -288,7 +225,7 @@ jobs:
             mv "${TMP_JAVA}" "${APP_DIR}/HelloController.java"
           fi
 
-          # 9) README.md
+          # (7) README.md
           if [ ! -f "README.md" ]; then
             printf '%s\n' \
               "# ${ARTIFACT_ID}" "" \
@@ -296,6 +233,63 @@ jobs:
               "## Build" '```bash' "./mvnw -B -DskipTests package" '```' "" \
               "## Run" '```bash' "./mvnw spring-boot:run" '```' > README.md
           fi
+
+      - name: Ensure Spring Boot main class & POM sanity (fix repackage error)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          APP_DIR="src/main/java/$(echo "${PACKAGE_NAME}" | tr '.' '/')"
+          mkdir -p "${APP_DIR}"
+
+          has_main="false"
+          if grep -Rsl --include="*.java" "@SpringBootApplication" src/main/java >/dev/null 2>&1; then
+            if grep -Rsl --include="*.java" "public static void main(String\[\] args)" src/main/java >/dev/null 2>&1; then
+              has_main="true"
+            fi
+          fi
+
+          if [ "${has_main}" != "true" ]; then
+            APP_FILE="${APP_DIR}/Application.java"
+            echo "No @SpringBootApplication main found → generating ${APP_FILE}"
+            printf '%s\n' \
+              "package ${PACKAGE_NAME};" \
+              "" \
+              "import org.springframework.boot.SpringApplication;" \
+              "import org.springframework.boot.autoconfigure.SpringBootApplication;" \
+              "" \
+              "@SpringBootApplication" \
+              "public class Application {" \
+              "  public static void main(String[] args) {" \
+              "    SpringApplication.run(Application.class, args);" \
+              "  }" \
+              "}" > "${APP_FILE}"
+          fi
+
+          if [ -f pom.xml ]; then
+            if ! grep -q '<packaging>' pom.xml; then
+              sed -i '0,/<version>.*<\/version>/{s//&\n    <packaging>jar<\/packaging>/}' pom.xml || true
+            else
+              sed -i 's#<packaging>[^<]\+</packaging>#<packaging>jar</packaging>#' pom.xml || true
+            fi
+            if ! grep -q '<artifactId>spring-boot-starter</artifactId>' pom.xml; then
+              if grep -q '<dependencies>' pom.xml; then
+                awk '
+                  /<dependencies>/ && !added {
+                    print;
+                    print "    <dependency>";
+                    print "      <groupId>org.springframework.boot</groupId>";
+                    print "      <artifactId>spring-boot-starter</artifactId>";
+                    print "    </dependency>";
+                    added=1; next
+                  }1
+                ' pom.xml > pom.tmp && mv pom.tmp pom.xml
+              else
+                sed -i 's#</project>#  <dependencies>\n    <dependency>\n      <groupId>org.springframework.boot</groupId>\n      <artifactId>spring-boot-starter</artifactId>\n    </dependency>\n  </dependencies>\n</project>#' pom.xml
+              fi
+            fi
+          fi
+
+          echo "Main class & POM sanity ensured."
 
       - name: Set up Java (Temurin ${{ env.JAVA_VERSION }})
         uses: actions/setup-java@v4
@@ -315,7 +309,6 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-          # Maven Wrapper → 3.9.9 (없으면 mvn 설치 후 수행)
           if [ -f "./mvnw" ]; then
             ./mvnw -B -ntp -N wrapper:wrapper -Dmaven="${MVN_WRAPPER_TARGET}" || true
           else
@@ -323,14 +316,10 @@ jobs:
             mvn -B -ntp -N wrapper:wrapper -Dmaven="${MVN_WRAPPER_TARGET}" || true
           fi
           [ -f "./mvnw" ] && chmod +x ./mvnw
-
-          # Spring Boot 버전 지정 시 우선 반영 (property 또는 parent)
           if [ -n "${BOOT_VERSION}" ]; then
             ./mvnw -B -ntp versions:set-property -Dproperty=spring-boot.version -DnewVersion="${BOOT_VERSION}" -DgenerateBackupPoms=false || true
             ./mvnw -B -ntp versions:update-parent -DparentVersion="[${BOOT_VERSION}]" -DgenerateBackupPoms=false || true
           fi
-
-          # 의존성 최신 릴리즈로 (스냅샷 제외)
           ./mvnw -B -ntp versions:use-latest-releases -DallowSnapshots=false -DgenerateBackupPoms=false || true
 
       - name: Build with Maven Wrapper (or apt maven)
@@ -357,22 +346,16 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-          # 현재 버전 추출 (첫 번째 <version>…</version>)
           CURR_VER="$(grep -m1 -oE '<version>[^<]+' pom.xml | sed 's/<version>//' | sed 's/-SNAPSHOT$//')"
-          echo "Current version: ${CURR_VER}"
-          MAJ=$(echo "${CURR_VER}" | cut -d. -f1)
-          MIN=$(echo "${CURR_VER}" | cut -d. -f2)
-          PAT=$(echo "${CURR_VER}" | cut -d. -f3 | sed 's/[^0-9].*//;s/^$/.0/')
-          [ -z "${MAJ}" ] && MAJ=0
-          [ -z "${MIN}" ] && MIN=0
-          [ -z "${PAT}" ] && PAT=0
+          MAJ=$(echo "${CURR_VER}" | cut -d. -f1); [ -z "${MAJ}" ] && MAJ=0
+          MIN=$(echo "${CURR_VER}" | cut -d. -f2); [ -z "${MIN}" ] && MIN=0
+          PAT=$(echo "${CURR_VER}" | cut -d. -f3 | sed 's/[^0-9].*//'); [ -z "${PAT}" ] && PAT=0
           case "${RELEASE_MODE}" in
             auto-major) MAJ=$((MAJ+1)); MIN=0; PAT=0 ;;
             auto-minor) MIN=$((MIN+1)); PAT=0 ;;
             auto-patch|*) PAT=$((PAT+1)) ;;
           esac
           NEW_VER="${MAJ}.${MIN}.${PAT}"
-          echo "Bumping to ${NEW_VER}"
           ./mvnw -B -ntp versions:set -DnewVersion="${NEW_VER}" -DgenerateBackupPoms=false || true
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -387,18 +370,12 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-          if [ "${RELEASE_MODE}" = "manual-tag" ] && [ -n "${NEW_VERSION}" ]; then
-            TAG="v${NEW_VERSION}"
-          elif [ "${RELEASE_MODE}" = "manual-tag" ]; then
-            # 수동 태그 모드지만 버전 미지정 → 타임스탬프 태그
-            TAG="v$(date +%Y%m%d-%H%M%S)"
-          elif [ -n "${NEW_VERSION}" ]; then
+          if [ -n "${NEW_VERSION}" ]; then
             TAG="v${NEW_VERSION}"
           else
             TAG="v$(date +%Y%m%d-%H%M%S)"
           fi
           echo "tag=${TAG}" >> $GITHUB_OUTPUT
-          echo "Release tag: ${TAG}"
           git tag -a "${TAG}" -m "Release ${TAG}" || true
           git push origin "${TAG}" || true
 
@@ -407,9 +384,7 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-          ZIP_OUT="${RUNNER_TEMP}/${{ env.ARTIFACT_ID }}-src.zip"
-          # 리포 전체를 zip (gitignored 포함 X)
-          git archive -o "${ZIP_OUT}" HEAD
+          git archive -o "${RUNNER_TEMP}/${{ env.ARTIFACT_ID }}-src.zip" HEAD
 
       - name: Create GitHub Release and Upload Artifacts
         if: ${{ env.RUN_RELEASE == 'true' && github.event_name != 'pull_request' }}

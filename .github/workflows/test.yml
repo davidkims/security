@@ -1,405 +1,194 @@
-name: "⚙️ Spring Boot + Maven: EchoOps (Clean)"
+# .github/workflows/springboot-curl-ci.yml
+name: "CI (Spring Boot via curl + Maven)"
 
 on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
   workflow_dispatch:
     inputs:
-      project_dir:
-        description: "프로젝트 루트 (pom.xml 위치)"
-        required: true
-        default: "."
       group_id:
         description: "Maven groupId"
         required: true
         default: "com.example"
       artifact_id:
-        description: "Maven artifactId"
+        description: "Maven artifactId (프로젝트 폴더명)"
         required: true
         default: "demo-app"
       package_name:
         description: "기본 패키지 (예: com.example.demo)"
         required: true
         default: "com.example.demo"
-      spring_boot_version:
+      boot_version:
         description: "Spring Boot 버전"
         required: true
         default: "3.3.3"
       java_version:
-        description: "JDK 버전"
+        description: "Java 버전"
         required: true
         default: "17"
-      generate_dirs_count:
-        description: "대량 에코 디렉토리 개수"
+      dependencies:
+        description: "Initializr dependencies (쉼표구분, 예: web,actuator,lombok,validation)"
         required: true
-        default: "50"
-      run_build:
-        description: "빌드 실행 (true/false)"
-        required: true
-        default: "true"
-      run_tests:
-        description: "테스트 실행 (true/false)"
-        required: true
-        default: "true"
-      commit_changes:
-        description: "커밋/푸시 (true/false)"
-        required: true
-        default: "true"
-
-permissions:
-  contents: write
-
-concurrency:
-  group: echoops-${{ github.ref }}
-  cancel-in-progress: false
+        default: "web,actuator,lombok,validation"
 
 jobs:
-  echoops:
+  build:
     runs-on: ubuntu-latest
+
     env:
-      PROJECT_DIR: ${{ inputs.project_dir }}
-      GROUP_ID: ${{ inputs.group_id }}
-      ARTIFACT_ID: ${{ inputs.artifact_id }}
-      PACKAGE_NAME: ${{ inputs.package_name }}
-      SB_VERSION: ${{ inputs.spring_boot_version }}
-      JAVA_VERSION: ${{ inputs.java_version }}
-      GEN_COUNT: ${{ inputs.generate_dirs_count }}
-      RUN_BUILD: ${{ inputs.run_build }}
-      RUN_TESTS: ${{ inputs.run_tests }}
-      COMMIT_CHANGES: ${{ inputs.commit_changes }}
+      GROUP_ID: ${{ github.event.inputs.group_id || 'com.example' }}
+      ARTIFACT_ID: ${{ github.event.inputs.artifact_id || 'demo-app' }}
+      PACKAGE_NAME: ${{ github.event.inputs.package_name || 'com.example.demo' }}
+      BOOT_VERSION: ${{ github.event.inputs.boot_version || '3.3.3' }}
+      JAVA_VERSION: ${{ github.event.inputs.java_version || '17' }}
+      DEPENDENCIES: ${{ github.event.inputs.dependencies || 'web,actuator,lombok,validation' }}
+      PROJECT_DIR: . # 레포 루트에 전개 (원하면 ./app 등으로 변경)
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Java (Temurin)
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: ${{ env.JAVA_VERSION }}
-          cache: maven
-
-      - name: Init / Echo Info
-        shell: bash
+      - name: Install tools
         run: |
           set -Eeuo pipefail
-          echo "[Echo] PROJECT_DIR=${PROJECT_DIR}"
-          echo "[Echo] GROUP_ID=${GROUP_ID} ARTIFACT_ID=${ARTIFACT_ID} PACKAGE_NAME=${PACKAGE_NAME}"
-          echo "[Echo] JAVA_VERSION=${JAVA_VERSION} SB_VERSION=${SB_VERSION}"
-          echo "[Echo] GEN_COUNT=${GEN_COUNT} RUN_BUILD=${RUN_BUILD} RUN_TESTS=${RUN_TESTS} COMMIT_CHANGES=${COMMIT_CHANGES}"
+          sudo apt-get update -y
+          sudo apt-get install -y curl unzip
 
-      - name: Create Skeleton + Bulk Dirs
-        shell: bash
+      - name: Generate Spring Boot project via curl (if no pom.xml)
         run: |
           set -Eeuo pipefail
-          mkdir -p "${PROJECT_DIR}"/{src/main/java,src/main/resources,src/test/java,scripts,docs,data}
-          mkdir -p "${PROJECT_DIR}"/.github/echo/{logs,sql,permissions,java,resources,bulk}
-          echo "[Echo] Bulk create ${GEN_COUNT} dirs"
-          for i in $(seq 1 "${GEN_COUNT}"); do
-            d="${PROJECT_DIR}/.github/echo/bulk/dir_${i}"
-            mkdir -p "$d"
-            printf "# Echo Bulk Dir %s\n" "$i" > "$d/README.md"
-          done
-          echo "[Done] Skeleton ready"
-
-      - name: Compute Package Path
-        id: pkg
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          PKG_PATH="$(echo "${PACKAGE_NAME}" | tr '.' '/')"
-          echo "PKG_PATH=${PKG_PATH}" >> "$GITHUB_OUTPUT"
-          echo "[Echo] PKG_PATH=${PKG_PATH}"
-
-      - name: Generate pom.xml (if missing)
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          POM="${PROJECT_DIR}/pom.xml"
-          if [[ -f "$POM" ]]; then
-            echo "[Echo] pom.xml exists. Skip."
+          # 이미 pom.xml이 있으면 생성 스킵
+          if find "${PROJECT_DIR}" -maxdepth 2 -name "pom.xml" | grep -q .; then
+            echo "pom.xml detected -> skip Initializr download"
             exit 0
           fi
-          cat > "$POM" <<'XML'
-<!-- EchoOps generated -->
-<project xmlns="http://maven.apache.org/POM/4.0.0"
-         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
-  <modelVersion>4.0.0</modelVersion>
 
-  <groupId>__GROUP_ID__</groupId>
-  <artifactId>__ARTIFACT_ID__</artifactId>
-  <version>0.1.0</version>
-  <name>__ARTIFACT_ID__</name>
-  <description>Echo-generated Spring Boot app</description>
+          ZIP_PATH="${RUNNER_TEMP}/${ARTIFACT_ID}.zip"
+          echo "Downloading from Spring Initializr..."
+          curl -fsSL \
+            "https://start.spring.io/starter.zip?type=maven-project&language=java&bootVersion=${BOOT_VERSION}&baseDir=${ARTIFACT_ID}&groupId=${GROUP_ID}&artifactId=${ARTIFACT_ID}&name=${ARTIFACT_ID}&packageName=${PACKAGE_NAME}&javaVersion=${JAVA_VERSION}&dependencies=${DEPENDENCIES}" \
+            -o "${ZIP_PATH}"
 
-  <properties>
-    <java.version>__JAVA_VERSION__</java.version>
-    <spring-boot.version>__SB_VERSION__</spring-boot.version>
-    <maven.compiler.release>__JAVA_VERSION__</maven.compiler.release>
-    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-  </properties>
+          echo "Unzipping to ${PROJECT_DIR} ..."
+          unzip -q "${ZIP_PATH}" -d "${PROJECT_DIR}"
 
-  <dependencyManagement>
-    <dependencies>
-      <dependency>
-        <groupId>org.springframework.boot</groupId>
-        <artifactId>spring-boot-dependencies</artifactId>
-        <version>${spring-boot.version}</version>
-        <type>pom</type>
-        <scope>import</scope>
-      </dependency>
-    </dependencies>
-  </dependencyManagement>
+          # 루트로 바로 전개되면 좋지만, baseDir 하위에 생성될 수 있으니 평탄화
+          if [ -d "${PROJECT_DIR}/${ARTIFACT_ID}" ]; then
+            shopt -s dotglob
+            mv "${PROJECT_DIR}/${ARTIFACT_ID}/"* "${PROJECT_DIR}/"
+            rmdir "${PROJECT_DIR}/${ARTIFACT_ID}"
+          fi
 
-  <dependencies>
-    <dependency>
-      <groupId>org.springframework.boot</groupId>
-      <artifactId>spring-boot-starter-web</artifactId>
-    </dependency>
-    <dependency>
-      <groupId>org.springframework.boot</groupId>
-      <artifactId>spring-boot-starter-actuator</artifactId>
-    </dependency>
-    <dependency>
-      <groupId>org.springframework.boot</groupId>
-      <artifactId>spring-boot-starter-test</artifactId>
-      <scope>test</scope>
-    </dependency>
-  </dependencies>
-
-  <build>
-    <plugins>
-      <plugin>
-        <groupId>org.springframework.boot</groupId>
-        <artifactId>spring-boot-maven-plugin</artifactId>
-        <executions>
-          <execution>
-            <goals>
-              <goal>repackage</goal>
-            </goals>
-          </execution>
-        </executions>
-      </plugin>
-      <plugin>
-        <groupId>org.apache.maven.plugins</groupId>
-        <artifactId>maven-compiler-plugin</artifactId>
-        <version>3.13.0</version>
-        <configuration>
-          <release>${maven.compiler.release}</release>
-        </configuration>
-      </plugin>
-      <plugin>
-        <groupId>org.apache.maven.plugins</groupId>
-        <artifactId>maven-surefire-plugin</artifactId>
-        <version>3.2.5</version>
-        <configuration>
-          <useSystemClassLoader>true</useSystemClassLoader>
-        </configuration>
-      </plugin>
-    </plugins>
-  </build>
-</project>
-XML
-          # 안전한 구분자(@) 사용
-          sed -i "s@__GROUP_ID__@${GROUP_ID}@g" "$POM"
-          sed -i "s@__ARTIFACT_ID__@${ARTIFACT_ID}@g" "$POM"
-          sed -i "s@__JAVA_VERSION__@${JAVA_VERSION}@g" "$POM"
-          sed -i "s@__SB_VERSION__@${SB_VERSION}@g" "$POM"
-          echo "[Done] pom.xml generated"
-
-      - name: Create .gitignore / README / scripts
-        shell: bash
+      - name: Ensure basic files (via curl or fallback creation)
         run: |
           set -Eeuo pipefail
-          if [[ ! -f "${PROJECT_DIR}/.gitignore" ]]; then
-            cat > "${PROJECT_DIR}/.gitignore" <<'EOF'
-target/
-.idea/
-*.iml
-*.log
-*.tmp
-*.DS_Store
-.mvn/
-.settings/
-.project
-.classpath
-EOF
+          # .gitignore (없으면 GitHub 템플릿 다운로드)
+          if [ ! -f ".gitignore" ]; then
+            echo "Downloading Java.gitignore ..."
+            curl -fsSL "https://raw.githubusercontent.com/github/gitignore/main/Java.gitignore" -o ".gitignore" || {
+              echo "# fallback .gitignore" > .gitignore
+              cat <<'EOT' >> .gitignore
+              target/
+              .idea/
+              .project
+              .classpath
+              .settings/
+              .DS_Store
+              *.iml
+              EOT
+            }
           fi
 
-          if [[ ! -f "${PROJECT_DIR}/README.md" ]]; then
-            cat > "${PROJECT_DIR}/README.md" <<EOF
-# ${ARTIFACT_ID}
-
-Generated by EchoOps  
-Java ${JAVA_VERSION}, Spring Boot ${SB_VERSION}  
-Package: \`${PACKAGE_NAME}\`
-
-## Build
-\`\`\`bash
-mvn -B -U -DskipTests=false clean package
-\`\`\`
-EOF
+          # application.yml (없으면 최소 설정 생성)
+          RES_DIR="src/main/resources"
+          mkdir -p "${RES_DIR}"
+          if [ ! -f "${RES_DIR}/application.yml" ]; then
+            echo "Creating ${RES_DIR}/application.yml ..."
+            cat > "${RES_DIR}/application.yml" <<'YML'
+            server:
+              port: 8080
+            management:
+              endpoints:
+                web:
+                  exposure:
+                    include: health,info
+            spring:
+              application:
+                name: demo-app
+            YML
           fi
 
-          cat > "${PROJECT_DIR}/scripts/permissions.sh" <<'BASH'
-#!/usr/bin/env bash
-set -Eeuo pipefail
-echo "[Echo] Apply executable permissions"
-chmod +x ./scripts/*.sh 2>/dev/null || true
-find .github/echo -type f -name "*.sh" -exec chmod +x {} \; 2>/dev/null || true
-echo "[Done] Permissions applied"
-BASH
-          chmod +x "${PROJECT_DIR}/scripts/permissions.sh"
+          # 샘플 Controller (없을 때만)
+          APP_DIR="src/main/java/$(echo "${PACKAGE_NAME}" | tr '.' '/')"
+          mkdir -p "${APP_DIR}"
+          if ! ls "${APP_DIR}"/*.java >/dev/null 2>&1; then
+            echo "Creating sample controller ..."
+            cat > "${APP_DIR}/HelloController.java" <<'JAVA'
+            package REPLACE_ME;
 
-      - name: Java sources & resources
-        shell: bash
+            import org.springframework.web.bind.annotation.GetMapping;
+            import org.springframework.web.bind.annotation.RestController;
+
+            @RestController
+            public class HelloController {
+              @GetMapping("/")
+              public String hello() {
+                return "Hello Spring Boot (curl + CI)!";
+              }
+            }
+            JAVA
+            sed -i "s|REPLACE_ME|${PACKAGE_NAME}|g" "${APP_DIR}/HelloController.java"
+          fi
+
+          # README.md 없으면 생성
+          if [ ! -f "README.md" ]; then
+            cat > README.md <<EOF
+            # ${ARTIFACT_ID}
+
+            Generated via GitHub Actions (curl + Spring Initializr)
+
+            ## Build
+            \`\`\`bash
+            ./mvnw -B -DskipTests package
+            \`\`\`
+
+            ## Run
+            \`\`\`bash
+            ./mvnw spring-boot:run
+            \`\`\`
+            EOF
+          fi
+
+      - name: Set up Java (Temurin ${{ env.JAVA_VERSION }})
+        uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: "maven"
+
+      - name: Make mvnw executable (if present)
         run: |
           set -Eeuo pipefail
-          PKG_PATH="${{ steps.pkg.outputs.PKG_PATH }}"
-          MAIN_DIR="${PROJECT_DIR}/src/main/java/${PKG_PATH}"
-          TEST_DIR="${PROJECT_DIR}/src/test/java/${PKG_PATH}"
-          RES_DIR="${PROJECT_DIR}/src/main/resources"
-          mkdir -p "${MAIN_DIR}" "${TEST_DIR}" "${RES_DIR}"
-
-          if [[ ! -f "${MAIN_DIR}/DemoApplication.java" ]]; then
-            cat > "${MAIN_DIR}/DemoApplication.java" <<EOF
-package ${PACKAGE_NAME};
-
-import org.springframework.boot.SpringApplication;
-import org.springframework.boot.autoconfigure.SpringBootApplication;
-
-@SpringBootApplication
-public class DemoApplication {
-  public static void main(String[] args) {
-    SpringApplication.run(DemoApplication.class, args);
-  }
-}
-EOF
+          if [ -f "./mvnw" ]; then
+            chmod +x ./mvnw
           fi
 
-          if [[ ! -f "${MAIN_DIR}/HelloController.java" ]]; then
-            cat > "${MAIN_DIR}/HelloController.java" <<EOF
-package ${PACKAGE_NAME};
-
-import org.springframework.web.bind.annotation.GetMapping;
-import org.springframework.web.bind.annotation.RestController;
-
-@RestController
-public class HelloController {
-  @GetMapping("/")
-  public String root() { return "OK"; }
-  @GetMapping("/hello")
-  public String hello() { return "Hello, EchoOps!"; }
-}
-EOF
-          fi
-
-          if [[ ! -f "${RES_DIR}/application.yml" ]]; then
-            cat > "${RES_DIR}/application.yml" <<'YAML'
-server:
-  port: 8080
-spring:
-  application:
-    name: echoops-app
-management:
-  endpoints:
-    web:
-      exposure:
-        include: health,info,metrics,env
-YAML
-          fi
-
-          if [[ ! -f "${TEST_DIR}/DemoApplicationTests.java" ]]; then
-            cat > "${TEST_DIR}/DemoApplicationTests.java" <<EOF
-package ${PACKAGE_NAME};
-
-import org.junit.jupiter.api.Test;
-import org.springframework.boot.test.context.SpringBootTest;
-
-@SpringBootTest
-class DemoApplicationTests {
-  @Test
-  void contextLoads() {}
-}
-EOF
-          fi
-          echo "[Done] Java sources created"
-
-      - name: SQL & permission scripts
-        shell: bash
+      - name: Build with Maven Wrapper
         run: |
           set -Eeuo pipefail
-          cat > "${PROJECT_DIR}/.github/echo/sql/create_users.sql" <<'SQL'
--- MySQL sample
-CREATE USER IF NOT EXISTS 'appuser'@'%' IDENTIFIED BY 'change_me!';
-CREATE DATABASE IF NOT EXISTS appdb CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;
-GRANT ALL PRIVILEGES ON appdb.* TO 'appuser'@'%';
-FLUSH PRIVILEGES;
-SQL
-
-          cat > "${PROJECT_DIR}/.github/echo/sql/grants.sql" <<'SQL'
-GRANT SELECT, INSERT, UPDATE, DELETE ON appdb.* TO 'appuser'@'%';
-SQL
-
-          cat > "${PROJECT_DIR}/.github/echo/permissions/apply.sh" <<'BASH'
-#!/usr/bin/env bash
-set -Eeuo pipefail
-echo "[Echo] Tighten Echo permissions"
-chmod -R go-rwx .github/echo || true
-chmod +x .github/echo/permissions/*.sh || true
-echo "[Done] Echo permissions tightened"
-BASH
-          chmod +x "${PROJECT_DIR}/.github/echo/permissions/apply.sh"
-
-      - name: Build & Test (optional)
-        if: ${{ env.RUN_BUILD == 'true' }}
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          cd "${PROJECT_DIR}"
-          if [[ "${RUN_TESTS}" == "true" ]]; then
-            mvn -B -U clean verify
+          if [ -f "./mvnw" ]; then
+            ./mvnw -B -DskipTests package
           else
-            mvn -B -U -DskipTests=true clean package
+            echo "No mvnw found; installing maven and building"
+            sudo apt-get update -y
+            sudo apt-get install -y maven
+            mvn -B -DskipTests package
           fi
-          echo "[Done] Maven build"
 
-      - name: Apply permissions
-        shell: bash
+      - name: List build outputs
         run: |
           set -Eeuo pipefail
-          bash "${PROJECT_DIR}/scripts/permissions.sh"
-          bash "${PROJECT_DIR}/.github/echo/permissions/apply.sh"
-
-      - name: Log summary
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          LOG="${PROJECT_DIR}/.github/echo/logs/run_$(date +%Y%m%d_%H%M%S).log"
-          {
-            echo "PROJECT_DIR=${PROJECT_DIR}"
-            echo "GROUP_ID=${GROUP_ID}"
-            echo "ARTIFACT_ID=${ARTIFACT_ID}"
-            echo "PACKAGE_NAME=${PACKAGE_NAME}"
-            echo "JAVA_VERSION=${JAVA_VERSION}"
-            echo "SB_VERSION=${SB_VERSION}"
-            echo "RUN_BUILD=${RUN_BUILD} RUN_TESTS=${RUN_TESTS}"
-            echo "GEN_COUNT=${GEN_COUNT}"
-          } | tee "${LOG}"
-
-      - name: Commit & Push (optional)
-        if: ${{ env.COMMIT_CHANGES == 'true' }}
-        shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -Eeuo pipefail
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add "${PROJECT_DIR}" .github/echo || true
-          if [[ -n "$(git status --porcelain)" ]]; then
-            git commit -m "EchoOps: Spring Boot ${SB_VERSION} / Java ${JAVA_VERSION} / bulk=${GEN_COUNT}"
-            git push
-            echo "[Done] Changes committed & pushed"
-          else
-            echo "[Echo] No changes to commit"
-          fi
+          echo "Artifacts under target/:"
+          find target -maxdepth 1 -type f -name "*.jar" -print || true

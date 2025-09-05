@@ -1,4 +1,4 @@
-name: "CI (Spring Boot via curl + Upgrade + Release, Unified)"
+name: "CI (Spring Boot via curl + Self-Heal POM + Upgrade + Release)"
 
 on:
   push:
@@ -44,7 +44,7 @@ on:
         required: true
         default: "auto-patch"
       templates_zip_url:
-        description: "(선택) 템플릿 ZIP RAW URL(오버레이). 비우면 폴백 생성"
+        description: "(선택) 템플릿 ZIP RAW URL(오버레이)"
         required: false
         default: ""
 
@@ -78,7 +78,7 @@ jobs:
         run: |
           set -Eeuo pipefail
           sudo apt-get update -y
-          sudo apt-get install -y curl unzip zip git jq
+          sudo apt-get install -y curl unzip zip git jq maven
 
       - name: Generate Spring Boot project via curl (robust + fallbacks)
         shell: bash
@@ -131,14 +131,10 @@ jobs:
         run: |
           set -Eeuo pipefail
 
-          fetch() { # fetch <url> <out>
-            local url="$1" out="$2"
-            curl -fsSL --retry 2 --retry-delay 1 "$url" -o "$out"
-          }
+          fetch() { curl -fsSL --retry 2 --retry-delay 1 "$1" -o "$2"; }
 
-          # (0) Overlay ZIP (사용자 제공 URL 있을 때만)
+          # (0) Overlay ZIP (사용자 제공 시)
           if [ -n "${TEMPLATES_ZIP_URL}" ]; then
-            echo "Overlay from templates_zip_url..."
             TMP_Z="${RUNNER_TEMP}/tpl.zip"
             if fetch "${TEMPLATES_ZIP_URL}" "${TMP_Z}" && unzip -t "${TMP_Z}" >/dev/null 2>&1; then
               unzip -oq "${TMP_Z}" -d .
@@ -147,7 +143,7 @@ jobs:
             fi
           fi
 
-          # (1) .gitignore: GitHub 공식 템플릿 → 실패 시 폴백
+          # (1) .gitignore
           if [ ! -f ".gitignore" ]; then
             if ! fetch "https://raw.githubusercontent.com/github/gitignore/refs/heads/main/Java.gitignore" ".gitignore"; then
               printf '%s\n' 'target/' '.idea/' '.project' '.classpath' '.settings/' '.DS_Store' '*.iml' > .gitignore
@@ -155,56 +151,42 @@ jobs:
           fi
 
           # (2) resources yml들
-          RES="src/main/resources"
-          mkdir -p "${RES}"
+          RES="src/main/resources"; mkdir -p "${RES}"
           [ -f "${RES}/application.yml" ] || printf '%s\n' \
             'server:' '  port: 8080' \
             'management:' '  endpoints:' '    web:' '      exposure:' '        include: health,info' \
             'spring:' '  application:' '    name: demo-app' > "${RES}/application.yml"
-
           [ -f "${RES}/application-dev.yml" ] || printf '%s\n' \
             'spring:' '  config:' '    activate:' '      on-profile: dev' \
             'server:' '  port: 8081' > "${RES}/application-dev.yml"
-
           [ -f "${RES}/application-prod.yml" ] || printf '%s\n' \
             'spring:' '  config:' '    activate:' '      on-profile: prod' \
             'server:' '  port: 8080' > "${RES}/application-prod.yml"
 
-          # (3) Dockerfile (안전 템플릿)
-          if [ ! -f "Dockerfile" ]; then
-            printf '%s\n' \
-              'FROM eclipse-temurin:17-jre' \
-              'WORKDIR /app' \
-              'ARG JAR_FILE=target/*.jar' \
-              'COPY ${JAR_FILE} app.jar' \
-              'EXPOSE 8080' \
-              'ENTRYPOINT ["java","-jar","/app/app.jar"]' \
-              > Dockerfile
-          fi
-
-          # (4) compose.yaml (안전 템플릿)
-          if [ ! -f "compose.yaml" ]; then
-            printf '%s\n' \
-              'services:' \
-              '  app:' \
-              '    build: .' \
-              '    ports:' \
-              '      - "8080:8080"' \
-              '    environment:' \
-              '      - SPRING_PROFILES_ACTIVE=dev' \
-              > compose.yaml
-          fi
-
-          # (5) Procfile / Makefile
+          # (3) Dockerfile / compose / Procfile / Makefile
+          [ -f "Dockerfile" ] || printf '%s\n' \
+            'FROM eclipse-temurin:17-jre' \
+            'WORKDIR /app' \
+            'ARG JAR_FILE=target/*.jar' \
+            'COPY ${JAR_FILE} app.jar' \
+            'EXPOSE 8080' \
+            'ENTRYPOINT ["java","-jar","/app/app.jar"]' > Dockerfile
+          [ -f "compose.yaml" ] || printf '%s\n' \
+            'services:' \
+            '  app:' \
+            '    build: .' \
+            '    ports:' \
+            '      - "8080:8080"' \
+            '    environment:' \
+            '      - SPRING_PROFILES_ACTIVE=dev' > compose.yaml
           [ -f "Procfile" ] || printf '%s\n' 'web: java -jar target/*.jar' > Procfile
           if [ ! -f "Makefile" ]; then
             printf '%s\n' \
               'build:' '\t./mvnw -B -DskipTests package' \
-              'run:'   '\t./mvnw spring-boot:run' \
-              > Makefile
+              'run:'   '\t./mvnw spring-boot:run' > Makefile
           fi
 
-          # (6) 샘플 컨트롤러(없을 때만)
+          # (4) 샘플 컨트롤러(없을 때만)
           APP_DIR="src/main/java/$(echo "${PACKAGE_NAME}" | tr '.' '/')"
           mkdir -p "${APP_DIR}"
           if ! ls "${APP_DIR}"/*.java >/dev/null 2>&1; then
@@ -225,7 +207,7 @@ jobs:
             mv "${TMP_JAVA}" "${APP_DIR}/HelloController.java"
           fi
 
-          # (7) README.md
+          # (5) README
           if [ ! -f "README.md" ]; then
             printf '%s\n' \
               "# ${ARTIFACT_ID}" "" \
@@ -234,62 +216,187 @@ jobs:
               "## Run" '```bash' "./mvnw spring-boot:run" '```' > README.md
           fi
 
-      - name: Ensure Spring Boot main class & POM sanity (fix repackage error)
+      - name: Ensure main class and SELF-HEAL POM (no risky sed)
         shell: bash
         run: |
           set -Eeuo pipefail
+
+          # 1) 메인 클래스 보장
           APP_DIR="src/main/java/$(echo "${PACKAGE_NAME}" | tr '.' '/')"
           mkdir -p "${APP_DIR}"
+          if ! grep -Rsl --include="*.java" "@SpringBootApplication" src/main/java >/dev/null 2>&1; then
+            echo "No @SpringBootApplication found → create Application.java"
+            cat > "${APP_DIR}/Application.java" <<EOF
+          package ${PACKAGE_NAME};
 
-          has_main="false"
-          if grep -Rsl --include="*.java" "@SpringBootApplication" src/main/java >/dev/null 2>&1; then
-            if grep -Rsl --include="*.java" "public static void main(String\[\] args)" src/main/java >/dev/null 2>&1; then
-              has_main="true"
-            fi
+          import org.springframework.boot.SpringApplication;
+          import org.springframework.boot.autoconfigure.SpringBootApplication;
+
+          @SpringBootApplication
+          public class Application {
+            public static void main(String[] args) {
+              SpringApplication.run(Application.class, args);
+            }
+          }
+          EOF
           fi
 
-          if [ "${has_main}" != "true" ]; then
-            APP_FILE="${APP_DIR}/Application.java"
-            echo "No @SpringBootApplication main found → generating ${APP_FILE}"
-            printf '%s\n' \
-              "package ${PACKAGE_NAME};" \
-              "" \
-              "import org.springframework.boot.SpringApplication;" \
-              "import org.springframework.boot.autoconfigure.SpringBootApplication;" \
-              "" \
-              "@SpringBootApplication" \
-              "public class Application {" \
-              "  public static void main(String[] args) {" \
-              "    SpringApplication.run(Application.class, args);" \
-              "  }" \
-              "}" > "${APP_FILE}"
-          fi
+          # 2) POM 셀프 힐
+          DEFAULT_BOOT="${BOOT_VERSION:-3.3.3}"
+          DEFAULT_VER="0.0.1"
+          if [ ! -f pom.xml ]; then
+            echo "No pom.xml → create fresh Spring Boot POM"
+            cat > pom.xml <<EOF
+          <project xmlns="http://maven.apache.org/POM/4.0.0"
+                   xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                   xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+            <modelVersion>4.0.0</modelVersion>
 
-          if [ -f pom.xml ]; then
-            if ! grep -q '<packaging>' pom.xml; then
-              sed -i '0,/<version>.*<\/version>/{s//&\n    <packaging>jar<\/packaging>/}' pom.xml || true
+            <parent>
+              <groupId>org.springframework.boot</groupId>
+              <artifactId>spring-boot-starter-parent</artifactId>
+              <version>${DEFAULT_BOOT}</version>
+              <relativePath/>
+            </parent>
+
+            <groupId>${GROUP_ID}</groupId>
+            <artifactId>${ARTIFACT_ID}</artifactId>
+            <version>${DEFAULT_VER}</version>
+            <name>${ARTIFACT_ID}</name>
+            <description>Spring Boot app</description>
+            <packaging>jar</packaging>
+
+            <properties>
+              <java.version>${JAVA_VERSION}</java.version>
+            </properties>
+
+            <dependencies>
+              <dependency>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-starter</artifactId>
+              </dependency>
+              <dependency>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-starter-test</artifactId>
+                <scope>test</scope>
+              </dependency>
+            </dependencies>
+
+            <build>
+              <plugins>
+                <plugin>
+                  <groupId>org.springframework.boot</groupId>
+                  <artifactId>spring-boot-maven-plugin</artifactId>
+                </plugin>
+              </plugins>
+            </build>
+          </project>
+          EOF
+          else
+            echo "Validate POM with Maven (will fail if malformed)"
+            if ! mvn -q -DskipTests help:evaluate -Dexpression=project.version >/dev/null 2>&1; then
+              echo "::warning::Malformed POM detected → backup and recreate"
+              cp pom.xml pom.xml.broken.$(date +%s) || true
+              cat > pom.xml <<EOF
+          <project xmlns="http://maven.apache.org/POM/4.0.0"
+                   xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                   xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+            <modelVersion>4.0.0</modelVersion>
+
+            <parent>
+              <groupId>org.springframework.boot</groupId>
+              <artifactId>spring-boot-starter-parent</artifactId>
+              <version>${DEFAULT_BOOT}</version>
+              <relativePath/>
+            </parent>
+
+            <groupId>${GROUP_ID}</groupId>
+            <artifactId>${ARTIFACT_ID}</artifactId>
+            <version>${DEFAULT_VER}</version>
+            <name>${ARTIFACT_ID}</name>
+            <description>Spring Boot app</description>
+            <packaging>jar</packaging>
+
+            <properties>
+              <java.version>${JAVA_VERSION}</java.version>
+            </properties>
+
+            <dependencies>
+              <dependency>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-starter</artifactId>
+              </dependency>
+              <dependency>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-starter-test</artifactId>
+                <scope>test</scope>
+              </dependency>
+            </dependencies>
+
+            <build>
+              <plugins>
+                <plugin>
+                  <groupId>org.springframework.boot</groupId>
+                  <artifactId>spring-boot-maven-plugin</artifactId>
+                </plugin>
+              </plugins>
+            </build>
+          </project>
+          EOF
             else
-              sed -i 's#<packaging>[^<]\+</packaging>#<packaging>jar</packaging>#' pom.xml || true
-            fi
-            if ! grep -q '<artifactId>spring-boot-starter</artifactId>' pom.xml; then
-              if grep -q '<dependencies>' pom.xml; then
-                awk '
-                  /<dependencies>/ && !added {
-                    print;
-                    print "    <dependency>";
-                    print "      <groupId>org.springframework.boot</groupId>";
-                    print "      <artifactId>spring-boot-starter</artifactId>";
-                    print "    </dependency>";
-                    added=1; next
-                  }1
-                ' pom.xml > pom.tmp && mv pom.tmp pom.xml
-              else
-                sed -i 's#</project>#  <dependencies>\n    <dependency>\n      <groupId>org.springframework.boot</groupId>\n      <artifactId>spring-boot-starter</artifactId>\n    </dependency>\n  </dependencies>\n</project>#' pom.xml
+              echo "POM seems valid → ensure essentials without risky inline edits"
+
+              # (a) java.version
+              if ! grep -q "<java.version>" pom.xml; then
+                awk '1;/<properties>/{print "    <java.version>'"${JAVA_VERSION}"'</java.version>"}' pom.xml > pom.tmp && mv pom.tmp pom.xml
+              fi
+
+              # (b) spring-boot-starter 존재 보장
+              if ! grep -q '<artifactId>spring-boot-starter</artifactId>' pom.xml; then
+                if grep -q '<dependencies>' pom.xml; then
+                  awk '
+                    /<dependencies>/ && !added {
+                      print;
+                      print "    <dependency>";
+                      print "      <groupId>org.springframework.boot</groupId>";
+                      print "      <artifactId>spring-boot-starter</artifactId>";
+                      print "    </dependency>";
+                      added=1; next
+                    }1
+                  ' pom.xml > pom.tmp && mv pom.tmp pom.xml
+                else
+                  sed -i 's#</project>#  <dependencies>\n    <dependency>\n      <groupId>org.springframework.boot</groupId>\n      <artifactId>spring-boot-starter</artifactId>\n    </dependency>\n  </dependencies>\n</project>#' pom.xml
+                fi
+              fi
+
+              # (c) spring-boot-maven-plugin 존재 보장
+              if ! grep -q '<artifactId>spring-boot-maven-plugin</artifactId>' pom.xml; then
+                if grep -q '<build>' pom.xml; then
+                  awk '
+                    /<build>/ && !added {
+                      print;
+                      print "    <plugins>";
+                      print "      <plugin>";
+                      print "        <groupId>org.springframework.boot</groupId>";
+                      print "        <artifactId>spring-boot-maven-plugin</artifactId>";
+                      print "      </plugin>";
+                      print "    </plugins>";
+                      added=1; next
+                    }1
+                  ' pom.xml > pom.tmp && mv pom.tmp pom.xml
+                else
+                  sed -i 's#</project>#  <build>\n    <plugins>\n      <plugin>\n        <groupId>org.springframework.boot</groupId>\n        <artifactId>spring-boot-maven-plugin</artifactId>\n      </plugin>\n    </plugins>\n  </build>\n</project>#' pom.xml
+                fi
               fi
             fi
           fi
 
-          echo "Main class & POM sanity ensured."
+      - name: Ensure Maven Wrapper present (mvnw)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mvn -B -ntp -N wrapper:wrapper -Dmaven="${MVN_WRAPPER_TARGET}" || true
+          chmod +x ./mvnw || true
 
       - name: Set up Java (Temurin ${{ env.JAVA_VERSION }})
         uses: actions/setup-java@v4
@@ -298,23 +405,12 @@ jobs:
           java-version: ${{ env.JAVA_VERSION }}
           cache: "maven"
 
-      - name: Make mvnw executable (if present)
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          if [ -f "./mvnw" ]; then chmod +x ./mvnw; fi
-
       - name: Upgrade (Maven Wrapper / Spring Boot / Deps)
         if: ${{ env.RUN_UPGRADE == 'true' }}
         shell: bash
         run: |
           set -Eeuo pipefail
-          if [ -f "./mvnw" ]; then
-            ./mvnw -B -ntp -N wrapper:wrapper -Dmaven="${MVN_WRAPPER_TARGET}" || true
-          else
-            sudo apt-get update -y && sudo apt-get install -y maven
-            mvn -B -ntp -N wrapper:wrapper -Dmaven="${MVN_WRAPPER_TARGET}" || true
-          fi
+          ./mvnw -B -ntp -N wrapper:wrapper -Dmaven="${MVN_WRAPPER_TARGET}" || true
           [ -f "./mvnw" ] && chmod +x ./mvnw
           if [ -n "${BOOT_VERSION}" ]; then
             ./mvnw -B -ntp versions:set-property -Dproperty=spring-boot.version -DnewVersion="${BOOT_VERSION}" -DgenerateBackupPoms=false || true
@@ -322,17 +418,11 @@ jobs:
           fi
           ./mvnw -B -ntp versions:use-latest-releases -DallowSnapshots=false -DgenerateBackupPoms=false || true
 
-      - name: Build with Maven Wrapper (or apt maven)
+      - name: Build with Maven Wrapper
         shell: bash
         run: |
           set -Eeuo pipefail
-          if [ -f "./mvnw" ]; then
-            ./mvnw -B -DskipTests package
-          else
-            sudo apt-get update -y
-            sudo apt-get install -y maven
-            mvn -B -DskipTests package
-          fi
+          ./mvnw -B -DskipTests package
 
       - name: List build outputs
         shell: bash
@@ -346,10 +436,10 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-          CURR_VER="$(grep -m1 -oE '<version>[^<]+' pom.xml | sed 's/<version>//' | sed 's/-SNAPSHOT$//')"
-          MAJ=$(echo "${CURR_VER}" | cut -d. -f1); [ -z "${MAJ}" ] && MAJ=0
-          MIN=$(echo "${CURR_VER}" | cut -d. -f2); [ -z "${MIN}" ] && MIN=0
-          PAT=$(echo "${CURR_VER}" | cut -d. -f3 | sed 's/[^0-9].*//'); [ -z "${PAT}" ] && PAT=0
+          CURR_VER="$(./mvnw -q -Dexec.executable='echo' -Dexec.args='${project.version}' --non-recursive org.codehaus.mojo:exec-maven-plugin:3.5.0:echo | tail -n1 | sed 's/-SNAPSHOT$//')"
+          [ -z "${CURR_VER}" ] && CURR_VER="0.0.1"
+          IFS='.' read -r MAJ MIN PAT <<< "$(printf '%s' "${CURR_VER:-0.0.1}.0.0" | cut -d- -f1)"
+          : "${MAJ:=0}" ; : "${MIN:=0}" ; : "${PAT:=0}"
           case "${RELEASE_MODE}" in
             auto-major) MAJ=$((MAJ+1)); MIN=0; PAT=0 ;;
             auto-minor) MIN=$((MIN+1)); PAT=0 ;;

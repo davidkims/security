@@ -1,5 +1,4 @@
-# .github/workflows/springboot-curl-ci.yml
-name: "CI (Spring Boot via curl + Maven, Robust)"
+name: "CI (Spring Boot via curl + Maven, No-Heredoc)"
 
 on:
   push:
@@ -21,15 +20,15 @@ on:
         required: true
         default: "com.example.demo"
       boot_version:
-        description: "(선택) Spring Boot 버전. 비우면 Initializr 기본값 사용"
+        description: "(선택) Spring Boot 버전. 비우면 Initializr 기본값"
         required: false
-        default: "3.3.3"
+        default: ""
       java_version:
         description: "Java 버전"
         required: true
         default: "17"
       dependencies:
-        description: "Initializr dependencies (쉼표구분, 예: web,actuator,lombok,validation)"
+        description: "쉼표구분 deps (예: web,actuator,lombok,validation)"
         required: true
         default: "web,actuator,lombok,validation"
 
@@ -54,14 +53,14 @@ jobs:
         run: |
           set -Eeuo pipefail
           sudo apt-get update -y
-          sudo apt-get install -y curl unzip jq
+          sudo apt-get install -y curl unzip
 
-      - name: Generate Spring Boot project via curl (robust, with fallbacks)
+      - name: Generate Spring Boot project via curl (robust with fallbacks)
         shell: bash
         run: |
           set -Eeuo pipefail
 
-          # 이미 pom.xml이 있으면 생성 스킵
+          # 기존 pom.xml 있으면 생성 스킵
           if find "${PROJECT_DIR}" -maxdepth 2 -name "pom.xml" | grep -q .; then
             echo "pom.xml detected -> skip Initializr download"
             exit 0
@@ -83,7 +82,6 @@ jobs:
               req_deps="${DEPS_NO_SPACE}"
             fi
 
-            # 기본 공통 파라미터
             args=(
               --get -L -sS -o "${ZIP_PATH}" -w "%{http_code}"
               --data-urlencode "type=maven-project"
@@ -96,23 +94,21 @@ jobs:
               --data-urlencode "javaVersion=${JAVA_VERSION}"
               --data-urlencode "dependencies=${req_deps}"
             )
-
-            # bootVersion 사용 여부
             if [ "${use_boot}" = "with" ] && [ -n "${BOOT_VERSION}" ]; then
               args+=( --data-urlencode "bootVersion=${BOOT_VERSION}" )
             fi
 
             http_code="$(curl "${args[@]}" "${BASE_URL}" || true)"
             echo "HTTP ${http_code}"
-
             if [ "${http_code}" != "200" ]; then
               echo "::warning::Initializr request failed (HTTP ${http_code})"
+              echo "::endgroup::"
               return 1
             fi
 
-            # ZIP 유효성 확인
             if ! unzip -t "${ZIP_PATH}" >/dev/null 2>&1; then
               echo "::warning::Downloaded file is not a valid ZIP"
+              echo "::endgroup::"
               return 1
             fi
 
@@ -120,13 +116,11 @@ jobs:
             return 0
           }
 
-          # 1차: 사용자 지정 bootVersion + 전체 deps
+          # 1) 사용자 bootVersion + 전체 deps → 실패 시 2) bootVersion 제거 → 실패 시 3) 최소 deps(web)
           if ! attempt_download "with" "full"; then
             echo "Retry without bootVersion..."
-            # 2차: bootVersion 제거 + 전체 deps
             if ! attempt_download "without" "full"; then
               echo "Retry with minimal deps..."
-              # 3차: bootVersion 제거 + 최소 deps(web)
               if ! attempt_download "without" "minimal"; then
                 echo "::error::All Initializr attempts failed"
                 exit 1
@@ -136,91 +130,91 @@ jobs:
 
           echo "Unzipping to ${PROJECT_DIR} ..."
           unzip -q "${ZIP_PATH}" -d "${PROJECT_DIR}"
-
-          # baseDir 하위에 생성되었으면 평탄화
           if [ -d "${PROJECT_DIR}/${ARTIFACT_ID}" ]; then
             shopt -s dotglob
             mv "${PROJECT_DIR}/${ARTIFACT_ID}/"* "${PROJECT_DIR}/"
             rmdir "${PROJECT_DIR}/${ARTIFACT_ID}"
           fi
 
-      - name: Ensure basic files (.gitignore via curl, app.yml, sample controller)
+      - name: Ensure basic files (.gitignore via curl, app.yml, sample controller) — no heredoc
         shell: bash
         run: |
           set -Eeuo pipefail
-          # .gitignore 다운로드 (실패 시 폴백 생성)
+
+          # .gitignore: 원격 다운로드, 실패 시 로컬 생성 (printf)
           if [ ! -f ".gitignore" ]; then
             echo "Downloading Java.gitignore ..."
             if ! curl -fsSL "https://raw.githubusercontent.com/github/gitignore/main/Java.gitignore" -o ".gitignore"; then
               echo "::warning::.gitignore download failed; creating fallback"
-              cat > .gitignore <<'EOT'
-              target/
-              .idea/
-              .project
-              .classpath
-              .settings/
-              .DS_Store
-              *.iml
-              EOT
+              printf '%s\n' \
+                'target/' \
+                '.idea/' \
+                '.project' \
+                '.classpath' \
+                '.settings/' \
+                '.DS_Store' \
+                '*.iml' \
+                > .gitignore
             fi
           fi
 
-          # resources/application.yml
+          # resources/application.yml (printf)
           RES_DIR="src/main/resources"
           mkdir -p "${RES_DIR}"
           if [ ! -f "${RES_DIR}/application.yml" ]; then
-            cat > "${RES_DIR}/application.yml" <<'YML'
-            server:
-              port: 8080
-            management:
-              endpoints:
-                web:
-                  exposure:
-                    include: health,info
-            spring:
-              application:
-                name: demo-app
-            YML
+            printf '%s\n' \
+              'server:' \
+              '  port: 8080' \
+              'management:' \
+              '  endpoints:' \
+              '    web:' \
+              '      exposure:' \
+              '        include: health,info' \
+              'spring:' \
+              '  application:' \
+              '    name: demo-app' \
+              > "${RES_DIR}/application.yml"
           fi
 
-          # 패키지 경로 및 샘플 컨트롤러(없을 때만)
+          # 샘플 컨트롤러 (printf)
           APP_DIR="src/main/java/$(echo "${PACKAGE_NAME}" | tr '.' '/')"
           mkdir -p "${APP_DIR}"
           if ! ls "${APP_DIR}"/*.java >/dev/null 2>&1; then
-            cat > "${APP_DIR}/HelloController.java" <<'JAVA'
-            package REPLACE_ME;
-
-            import org.springframework.web.bind.annotation.GetMapping;
-            import org.springframework.web.bind.annotation.RestController;
-
-            @RestController
-            public class HelloController {
-              @GetMapping("/")
-              public String hello() {
-                return "Hello Spring Boot (curl + CI)!";
-              }
-            }
-            JAVA
-            sed -i "s|REPLACE_ME|${PACKAGE_NAME}|g" "${APP_DIR}/HelloController.java"
+            TMP_JAVA="${RUNNER_TEMP}/HelloController.java"
+            printf '%s\n' \
+              "package ${PACKAGE_NAME};" \
+              "" \
+              "import org.springframework.web.bind.annotation.GetMapping;" \
+              "import org.springframework.web.bind.annotation.RestController;" \
+              "" \
+              "@RestController" \
+              "public class HelloController {" \
+              "  @GetMapping(\"/\")" \
+              "  public String hello() {" \
+              "    return \"Hello Spring Boot (curl + CI)!\";" \
+              "  }" \
+              "}" \
+              > "${TMP_JAVA}"
+            mv "${TMP_JAVA}" "${APP_DIR}/HelloController.java"
           fi
 
-          # README.md 없으면 생성
+          # README.md (printf)
           if [ ! -f "README.md" ]; then
-            cat > README.md <<EOF
-            # ${ARTIFACT_ID}
-
-            Generated via GitHub Actions (curl + Spring Initializr)
-
-            ## Build
-            \`\`\`bash
-            ./mvnw -B -DskipTests package
-            \`\`\`
-
-            ## Run
-            \`\`\`bash
-            ./mvnw spring-boot:run
-            \`\`\`
-            EOF
+            printf '%s\n' \
+              "# ${ARTIFACT_ID}" \
+              "" \
+              "Generated via GitHub Actions (curl + Spring Initializr)" \
+              "" \
+              "## Build" \
+              '```bash' \
+              "./mvnw -B -DskipTests package" \
+              '```' \
+              "" \
+              "## Run" \
+              '```bash' \
+              "./mvnw spring-boot:run" \
+              '```' \
+              > README.md
           fi
 
       - name: Set up Java (Temurin ${{ env.JAVA_VERSION }})
@@ -231,20 +225,20 @@ jobs:
           cache: "maven"
 
       - name: Make mvnw executable (if present)
+        shell: bash
         run: |
           set -Eeuo pipefail
           if [ -f "./mvnw" ]; then
             chmod +x ./mvnw
           fi
 
-      - name: Build with Maven Wrapper
+      - name: Build with Maven Wrapper (or apt maven)
         shell: bash
         run: |
           set -Eeuo pipefail
           if [ -f "./mvnw" ]; then
             ./mvnw -B -DskipTests package
           else
-            echo "No mvnw found; installing maven and building"
             sudo apt-get update -y
             sudo apt-get install -y maven
             mvn -B -DskipTests package

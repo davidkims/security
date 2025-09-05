@@ -1,5 +1,5 @@
 # .github/workflows/springboot-curl-ci.yml
-name: "CI (Spring Boot via curl + Maven)"
+name: "CI (Spring Boot via curl + Maven, Robust)"
 
 on:
   push:
@@ -21,8 +21,8 @@ on:
         required: true
         default: "com.example.demo"
       boot_version:
-        description: "Spring Boot 버전"
-        required: true
+        description: "(선택) Spring Boot 버전. 비우면 Initializr 기본값 사용"
+        required: false
         default: "3.3.3"
       java_version:
         description: "Java 버전"
@@ -41,10 +41,10 @@ jobs:
       GROUP_ID: ${{ github.event.inputs.group_id || 'com.example' }}
       ARTIFACT_ID: ${{ github.event.inputs.artifact_id || 'demo-app' }}
       PACKAGE_NAME: ${{ github.event.inputs.package_name || 'com.example.demo' }}
-      BOOT_VERSION: ${{ github.event.inputs.boot_version || '3.3.3' }}
+      BOOT_VERSION: ${{ github.event.inputs.boot_version || '' }}
       JAVA_VERSION: ${{ github.event.inputs.java_version || '17' }}
       DEPENDENCIES: ${{ github.event.inputs.dependencies || 'web,actuator,lombok,validation' }}
-      PROJECT_DIR: . # 레포 루트에 전개 (원하면 ./app 등으로 변경)
+      PROJECT_DIR: .
 
     steps:
       - name: Checkout
@@ -54,42 +54,106 @@ jobs:
         run: |
           set -Eeuo pipefail
           sudo apt-get update -y
-          sudo apt-get install -y curl unzip
+          sudo apt-get install -y curl unzip jq
 
-      - name: Generate Spring Boot project via curl (if no pom.xml)
+      - name: Generate Spring Boot project via curl (robust, with fallbacks)
+        shell: bash
         run: |
           set -Eeuo pipefail
+
           # 이미 pom.xml이 있으면 생성 스킵
           if find "${PROJECT_DIR}" -maxdepth 2 -name "pom.xml" | grep -q .; then
             echo "pom.xml detected -> skip Initializr download"
             exit 0
           fi
 
+          BASE_URL="https://start.spring.io/starter.zip"
           ZIP_PATH="${RUNNER_TEMP}/${ARTIFACT_ID}.zip"
-          echo "Downloading from Spring Initializr..."
-          curl -fsSL \
-            "https://start.spring.io/starter.zip?type=maven-project&language=java&bootVersion=${BOOT_VERSION}&baseDir=${ARTIFACT_ID}&groupId=${GROUP_ID}&artifactId=${ARTIFACT_ID}&name=${ARTIFACT_ID}&packageName=${PACKAGE_NAME}&javaVersion=${JAVA_VERSION}&dependencies=${DEPENDENCIES}" \
-            -o "${ZIP_PATH}"
+          DEPS_NO_SPACE="$(echo "${DEPENDENCIES}" | tr -d '[:space:]')"
+
+          attempt_download() {
+            local use_boot="$1"   # "with" or "without"
+            local min_deps="$2"   # "full" or "minimal"
+            local http_code
+
+            echo "::group::Attempt: bootVersion=${use_boot}, deps=${min_deps}"
+            if [ "${min_deps}" = "minimal" ]; then
+              req_deps="web"
+            else
+              req_deps="${DEPS_NO_SPACE}"
+            fi
+
+            # 기본 공통 파라미터
+            args=(
+              --get -L -sS -o "${ZIP_PATH}" -w "%{http_code}"
+              --data-urlencode "type=maven-project"
+              --data-urlencode "language=java"
+              --data-urlencode "baseDir=${ARTIFACT_ID}"
+              --data-urlencode "groupId=${GROUP_ID}"
+              --data-urlencode "artifactId=${ARTIFACT_ID}"
+              --data-urlencode "name=${ARTIFACT_ID}"
+              --data-urlencode "packageName=${PACKAGE_NAME}"
+              --data-urlencode "javaVersion=${JAVA_VERSION}"
+              --data-urlencode "dependencies=${req_deps}"
+            )
+
+            # bootVersion 사용 여부
+            if [ "${use_boot}" = "with" ] && [ -n "${BOOT_VERSION}" ]; then
+              args+=( --data-urlencode "bootVersion=${BOOT_VERSION}" )
+            fi
+
+            http_code="$(curl "${args[@]}" "${BASE_URL}" || true)"
+            echo "HTTP ${http_code}"
+
+            if [ "${http_code}" != "200" ]; then
+              echo "::warning::Initializr request failed (HTTP ${http_code})"
+              return 1
+            fi
+
+            # ZIP 유효성 확인
+            if ! unzip -t "${ZIP_PATH}" >/dev/null 2>&1; then
+              echo "::warning::Downloaded file is not a valid ZIP"
+              return 1
+            fi
+
+            echo "::endgroup::"
+            return 0
+          }
+
+          # 1차: 사용자 지정 bootVersion + 전체 deps
+          if ! attempt_download "with" "full"; then
+            echo "Retry without bootVersion..."
+            # 2차: bootVersion 제거 + 전체 deps
+            if ! attempt_download "without" "full"; then
+              echo "Retry with minimal deps..."
+              # 3차: bootVersion 제거 + 최소 deps(web)
+              if ! attempt_download "without" "minimal"; then
+                echo "::error::All Initializr attempts failed"
+                exit 1
+              fi
+            fi
+          fi
 
           echo "Unzipping to ${PROJECT_DIR} ..."
           unzip -q "${ZIP_PATH}" -d "${PROJECT_DIR}"
 
-          # 루트로 바로 전개되면 좋지만, baseDir 하위에 생성될 수 있으니 평탄화
+          # baseDir 하위에 생성되었으면 평탄화
           if [ -d "${PROJECT_DIR}/${ARTIFACT_ID}" ]; then
             shopt -s dotglob
             mv "${PROJECT_DIR}/${ARTIFACT_ID}/"* "${PROJECT_DIR}/"
             rmdir "${PROJECT_DIR}/${ARTIFACT_ID}"
           fi
 
-      - name: Ensure basic files (via curl or fallback creation)
+      - name: Ensure basic files (.gitignore via curl, app.yml, sample controller)
+        shell: bash
         run: |
           set -Eeuo pipefail
-          # .gitignore (없으면 GitHub 템플릿 다운로드)
+          # .gitignore 다운로드 (실패 시 폴백 생성)
           if [ ! -f ".gitignore" ]; then
             echo "Downloading Java.gitignore ..."
-            curl -fsSL "https://raw.githubusercontent.com/github/gitignore/main/Java.gitignore" -o ".gitignore" || {
-              echo "# fallback .gitignore" > .gitignore
-              cat <<'EOT' >> .gitignore
+            if ! curl -fsSL "https://raw.githubusercontent.com/github/gitignore/main/Java.gitignore" -o ".gitignore"; then
+              echo "::warning::.gitignore download failed; creating fallback"
+              cat > .gitignore <<'EOT'
               target/
               .idea/
               .project
@@ -98,14 +162,13 @@ jobs:
               .DS_Store
               *.iml
               EOT
-            }
+            fi
           fi
 
-          # application.yml (없으면 최소 설정 생성)
+          # resources/application.yml
           RES_DIR="src/main/resources"
           mkdir -p "${RES_DIR}"
           if [ ! -f "${RES_DIR}/application.yml" ]; then
-            echo "Creating ${RES_DIR}/application.yml ..."
             cat > "${RES_DIR}/application.yml" <<'YML'
             server:
               port: 8080
@@ -120,11 +183,10 @@ jobs:
             YML
           fi
 
-          # 샘플 Controller (없을 때만)
+          # 패키지 경로 및 샘플 컨트롤러(없을 때만)
           APP_DIR="src/main/java/$(echo "${PACKAGE_NAME}" | tr '.' '/')"
           mkdir -p "${APP_DIR}"
           if ! ls "${APP_DIR}"/*.java >/dev/null 2>&1; then
-            echo "Creating sample controller ..."
             cat > "${APP_DIR}/HelloController.java" <<'JAVA'
             package REPLACE_ME;
 
@@ -176,6 +238,7 @@ jobs:
           fi
 
       - name: Build with Maven Wrapper
+        shell: bash
         run: |
           set -Eeuo pipefail
           if [ -f "./mvnw" ]; then
@@ -188,6 +251,7 @@ jobs:
           fi
 
       - name: List build outputs
+        shell: bash
         run: |
           set -Eeuo pipefail
           echo "Artifacts under target/:"
